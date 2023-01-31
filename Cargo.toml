@@ -1,0 +1,11 @@
+[package]
+name = "matrix_exif_bot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+config = "^0.13"
+matrix-sdk="^0.6"
+tokio = { version = "1.25.0", features = ["rt-multi-thread"] }
+kamadak-exif = "0.5"
