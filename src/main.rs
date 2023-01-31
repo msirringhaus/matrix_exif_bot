@@ -3,9 +3,12 @@ use matrix_sdk::{
     config::SyncSettings,
     event_handler::Ctx,
     room::Room,
-    ruma::events::room::message::{
-        LocationMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-        RoomMessageEventContent, TextMessageEventContent,
+    ruma::{
+        events::room::message::Relation,
+        events::room::message::{
+            InReplyTo, LocationMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
+            RoomMessageEventContent, TextMessageEventContent,
+        },
     },
     Client,
 };
@@ -19,7 +22,6 @@ async fn on_room_message(
     client: Client,
     botconfig: Ctx<Option<Config>>,
 ) {
-    println!("Sync: {:?}", event);
     if let Room::Joined(room) = room {
         let should_skip_message = botconfig
             .as_ref()
@@ -44,12 +46,14 @@ async fn on_room_message(
             }
             MessageType::Image(f) => {
                 let data = client.media().get_file(f, false).await;
-                println!("Data: {:?}", data);
                 if let Ok(Some(d)) = data {
                     if let Ok(l) = extract_location_from_exif(&d) {
-                        let content = RoomMessageEventContent::new(MessageType::Location(
-                            LocationMessageEventContent::new(l.clone(), l),
-                        ));
+                        let location = LocationMessageEventContent::new(l.clone(), l);
+                        let mut content =
+                            RoomMessageEventContent::new(MessageType::Location(location));
+                        content.relates_to = Some(Relation::Reply {
+                            in_reply_to: InReplyTo::new(event.event_id),
+                        });
                         room.send(content, None).await.unwrap();
                     };
                 }
