@@ -19,29 +19,25 @@ async fn on_room_message(
     event: OriginalSyncRoomMessageEvent,
     room: Room,
     client: Client,
-    botconfig: Ctx<Option<Config>>,
-) {
+    botconfig: Ctx<BotConfig>,
+) -> anyhow::Result<()> {
     if let Room::Joined(room) = room {
-        let should_skip_message = botconfig
-            .as_ref()
-            .and_then(|x| x.get_bool("ignore_own_messages").ok())
-            .unwrap_or(false);
-        if should_skip_message && Some(event.sender.as_ref()) == client.user_id() {
+        if botconfig.ignore_own_messages && Some(event.sender.as_ref()) == client.user_id() {
             // Our own message, skipping.
             println!("Skipping message from ourselves.");
-            return;
+            return Ok(());
         }
         match event.content.msgtype {
             MessageType::Text(TextMessageEventContent { body, .. }) => {
                 println!("Echoing: {}", body);
                 let content =
                     RoomMessageEventContent::text_plain(format!("I received: {:?}", body));
-                room.send(content, None).await.unwrap();
+                room.send(content, None).await?;
             }
             MessageType::File(f) => {
                 println!("Echoing: {:?}", f);
                 let content = RoomMessageEventContent::text_plain(format!("I received: {:?}", f));
-                room.send(content, None).await.unwrap();
+                room.send(content, None).await?;
             }
             MessageType::Image(f) => {
                 let data = client.media().get_file(f, false).await;
@@ -53,7 +49,7 @@ async fn on_room_message(
                         content.relates_to = Some(Relation::Reply {
                             in_reply_to: InReplyTo::new(event.event_id),
                         });
-                        room.send(content, None).await.unwrap();
+                        room.send(content, None).await?;
                     };
                 }
             }
@@ -61,16 +57,12 @@ async fn on_room_message(
             _ => { /* No-op */ }
         }
     }
+    Ok(())
 }
 
-async fn login_and_sync(
-    homeserver_url: String,
-    username: String,
-    password: String,
-    settings: Option<Config>,
-) -> anyhow::Result<()> {
+async fn login_and_sync(botconfig: BotConfig) -> anyhow::Result<()> {
     #[allow(unused_mut)]
-    let mut client_builder = Client::builder().homeserver_url(homeserver_url);
+    let mut client_builder = Client::builder().homeserver_url(botconfig.homeserver_url.clone());
 
     // #[cfg(feature = "sled")]
     // {
@@ -89,12 +81,12 @@ async fn login_and_sync(
 
     let client = client_builder.build().await?;
     client
-        .login_username(&username, &password)
-        .initial_device_display_name("command bot")
+        .login_username(&botconfig.username, &botconfig.password)
+        .initial_device_display_name("Command bot")
         .send()
         .await?;
 
-    println!("logged in as {username}");
+    println!("logged in as {}", botconfig.username);
 
     // An initial sync to set up state and so our bot doesn't respond to old
     // messages. If the `StateStore` finds saved state in the location given the
@@ -102,7 +94,7 @@ async fn login_and_sync(
     let response = client.sync_once(SyncSettings::default()).await?;
     // add our CommandBot to be notified of incoming messages, we do this after the
     // initial sync to avoid responding to messages before the bot was running.
-    client.add_event_handler_context(settings);
+    client.add_event_handler_context(botconfig);
     client.add_event_handler(on_room_message);
 
     // since we called `sync_once` before we entered our sync loop we must pass
@@ -115,6 +107,30 @@ async fn login_and_sync(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct BotConfig {
+    username: String,
+    password: String,
+    homeserver_url: String,
+    ignore_own_messages: bool,
+}
+
+impl BotConfig {
+    fn new(
+        username: String,
+        password: String,
+        homeserver_url: String,
+        ignore_own_messages: bool,
+    ) -> Self {
+        Self {
+            username,
+            password,
+            homeserver_url,
+            ignore_own_messages,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // ------- Getting the login-credentials from file -------
@@ -122,18 +138,22 @@ async fn main() -> anyhow::Result<()> {
     // tcp-connection, read from file, etc. Here, we use the config-crate to
     // load from botconfig.toml.
     // Change this file to your needs, if you want to use this example binary.
-    let mut settings = config::Config::default();
-    settings
-        .merge(config::File::with_name("botconfig"))
-        .unwrap();
+    let settings = Config::builder()
+        .add_source(config::File::with_name("botconfig"))
+        // Add in settings from the environment (with a prefix of BOT)
+        // Eg.. `BOT_DEBUG=1 ./target/app` would set the `debug` key
+        .add_source(config::Environment::with_prefix("BOT"))
+        .build()?;
 
-    let username = settings.get_string("username").unwrap();
-    let password = settings.get_string("password").unwrap();
-    let homeserver_url = settings.get_string("homeserver_url").unwrap();
+    let username = settings.get_string("username")?;
+    let password = settings.get_string("password")?;
+    let homeserver_url = settings.get_string("homeserver_url")?;
+    let ignore_own_messages = settings.get_bool("ignore_own_messages").unwrap_or(false);
     // -------------------------------------------------------
+    let botconfig = BotConfig::new(username, password, homeserver_url, ignore_own_messages);
 
     tracing_subscriber::fmt::init();
 
-    login_and_sync(homeserver_url, username, password, Some(settings)).await?;
+    login_and_sync(botconfig).await?;
     Ok(())
 }
