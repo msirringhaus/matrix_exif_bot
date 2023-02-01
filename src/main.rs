@@ -4,14 +4,19 @@ use matrix_sdk::{
     event_handler::Ctx,
     room::Room,
     ruma::{
-        events::room::message::Relation,
-        events::room::message::{
-            InReplyTo, LocationMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-            RoomMessageEventContent, TextMessageEventContent,
+        events::room::member::StrippedRoomMemberEvent,
+        events::{
+            reaction,
+            room::message::{
+                InReplyTo, LocationMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
+                RoomMessageEventContent, TextMessageEventContent,
+            },
         },
+        events::{reaction::ReactionEventContent, room::message::Relation},
     },
     Client,
 };
+use tokio::time::{sleep, Duration};
 mod exif;
 use crate::exif::extract_location_from_exif;
 
@@ -29,15 +34,11 @@ async fn on_room_message(
         }
         match event.content.msgtype {
             MessageType::Text(TextMessageEventContent { body, .. }) => {
-                println!("Echoing: {}", body);
-                let content =
-                    RoomMessageEventContent::text_plain(format!("I received: {:?}", body));
-                room.send(content, None).await?;
-            }
-            MessageType::File(f) => {
-                println!("Echoing: {:?}", f);
-                let content = RoomMessageEventContent::text_plain(format!("I received: {:?}", f));
-                room.send(content, None).await?;
+                if body == "!leave" {
+                    let content = RoomMessageEventContent::text_plain("Bye");
+                    room.send(content, None).await?;
+                    room.leave().await?;
+                }
             }
             MessageType::Image(f) => {
                 let data = client.media().get_file(f, false).await;
@@ -50,34 +51,60 @@ async fn on_room_message(
                             in_reply_to: InReplyTo::new(event.event_id),
                         });
                         room.send(content, None).await?;
-                    };
+                    } else {
+                        let content = ReactionEventContent::new(reaction::Relation::new(
+                            event.event_id,
+                            "‼️".to_string(),
+                        ));
+                        room.send(content, None).await?;
+                    }
                 }
             }
-
             _ => { /* No-op */ }
         }
     }
     Ok(())
 }
 
+async fn on_stripped_state_member(
+    room_member: StrippedRoomMemberEvent,
+    client: Client,
+    room: Room,
+) {
+    if room_member.state_key != client.user_id().unwrap() {
+        return;
+    }
+
+    if let Room::Invited(room) = room {
+        tokio::spawn(async move {
+            println!("Autojoining room {}", room.room_id());
+            let mut delay = 2;
+
+            while let Err(err) = room.accept_invitation().await {
+                // retry autojoin due to synapse sending invites, before the
+                // invited user can join for more information see
+                // https://github.com/matrix-org/synapse/issues/4345
+                eprintln!(
+                    "Failed to join room {} ({err:?}), retrying in {delay}s",
+                    room.room_id()
+                );
+
+                sleep(Duration::from_secs(delay)).await;
+                delay *= 2;
+
+                if delay > 3600 {
+                    eprintln!("Can't join room {} ({err:?})", room.room_id());
+                    break;
+                }
+            }
+            println!("Successfully joined room {}", room.room_id());
+        });
+    }
+}
+
 async fn login_and_sync(botconfig: BotConfig) -> anyhow::Result<()> {
     #[allow(unused_mut)]
     let mut client_builder = Client::builder().homeserver_url(botconfig.homeserver_url.clone());
-
-    // #[cfg(feature = "sled")]
-    // {
-    //     // The location to save files to
-    //     let home = dirs::home_dir()
-    //         .expect("no home directory found")
-    //         .join(".cache")
-    //         .join("exif_bot");
-    //     client_builder = client_builder.sled_store(home, None)?;
-    // }
-
-    // #[cfg(feature = "indexeddb")]
-    // {
-    //     client_builder = client_builder.indexeddb_store("exif_bot", None).await?;
-    // }
 
     let client = client_builder.build().await?;
     client
@@ -94,7 +121,10 @@ async fn login_and_sync(botconfig: BotConfig) -> anyhow::Result<()> {
     let response = client.sync_once(SyncSettings::default()).await?;
     // add our CommandBot to be notified of incoming messages, we do this after the
     // initial sync to avoid responding to messages before the bot was running.
-    client.add_event_handler_context(botconfig);
+    client.add_event_handler_context(botconfig.clone());
+    if botconfig.autojoin {
+        client.add_event_handler(on_stripped_state_member);
+    }
     client.add_event_handler(on_room_message);
 
     // since we called `sync_once` before we entered our sync loop we must pass
@@ -113,6 +143,7 @@ struct BotConfig {
     password: String,
     homeserver_url: String,
     ignore_own_messages: bool,
+    autojoin: bool,
 }
 
 impl BotConfig {
@@ -121,12 +152,14 @@ impl BotConfig {
         password: String,
         homeserver_url: String,
         ignore_own_messages: bool,
+        autojoin: bool,
     ) -> Self {
         Self {
             username,
             password,
             homeserver_url,
             ignore_own_messages,
+            autojoin,
         }
     }
 }
@@ -149,8 +182,15 @@ async fn main() -> anyhow::Result<()> {
     let password = settings.get_string("password")?;
     let homeserver_url = settings.get_string("homeserver_url")?;
     let ignore_own_messages = settings.get_bool("ignore_own_messages").unwrap_or(false);
+    let autojoin = settings.get_bool("autojoin").unwrap_or(true);
     // -------------------------------------------------------
-    let botconfig = BotConfig::new(username, password, homeserver_url, ignore_own_messages);
+    let botconfig = BotConfig::new(
+        username,
+        password,
+        homeserver_url,
+        ignore_own_messages,
+        autojoin,
+    );
 
     tracing_subscriber::fmt::init();
 
