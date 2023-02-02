@@ -1,18 +1,27 @@
 use config::Config;
 use matrix_sdk::{
     config::SyncSettings,
+    deserialized_responses::TimelineEvent,
     event_handler::Ctx,
-    room::Room,
+    room::{MessagesOptions, Room},
     ruma::{
+        api::client::filter::RoomEventFilter,
+        events::reaction::ReactionEventContent,
         events::room::member::StrippedRoomMemberEvent,
         events::{
             reaction,
-            room::message::{
-                InReplyTo, LocationMessageEventContent, MessageType, OriginalSyncRoomMessageEvent,
-                RoomMessageEventContent, TextMessageEventContent,
+            room::{
+                encrypted::Relation as EncryptedRelation,
+                message::{
+                    InReplyTo, LocationMessageEventContent, MessageType,
+                    OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+                    TextMessageEventContent,
+                },
+                redaction::OriginalSyncRoomRedactionEvent,
             },
+            AnySyncMessageLikeEvent, AnySyncTimelineEvent, SyncMessageLikeEvent,
         },
-        events::{reaction::ReactionEventContent, room::message::Relation},
+        OwnedEventId,
     },
     Client,
 };
@@ -54,7 +63,7 @@ async fn on_room_message(
                     } else {
                         let content = ReactionEventContent::new(reaction::Relation::new(
                             event.event_id,
-                            "‼️".to_string(),
+                            "🚫".to_string(),
                         ));
                         room.send(content, None).await?;
                     }
@@ -102,6 +111,87 @@ async fn on_stripped_state_member(
     }
 }
 
+fn try_to_parse_in_reply_to_from_raw(m: &TimelineEvent) -> Option<(OwnedEventId, OwnedEventId)> {
+    // Encrypted room messages
+    if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomEncrypted(
+        SyncMessageLikeEvent::Original(ev),
+    ))) = m.event.clone().cast().deserialize()
+    {
+        match ev.content.relates_to {
+            Some(EncryptedRelation::Reply {
+                in_reply_to: InReplyTo { event_id, .. },
+            }) => Some((ev.event_id, event_id)),
+            _ => None,
+        }
+    // Unencrypted room messages
+    } else if let Ok(AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+        SyncMessageLikeEvent::Original(ev),
+    ))) = m.event.clone().cast().deserialize()
+    {
+        match ev.content.relates_to {
+            Some(Relation::Reply {
+                in_reply_to: InReplyTo { event_id, .. },
+            }) => Some((ev.event_id, event_id)),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+async fn on_redacted_state_member(
+    event: OriginalSyncRoomRedactionEvent,
+    client: Client,
+    room: Room,
+) -> anyhow::Result<()> {
+    if Some(event.sender.as_ref()) == client.user_id() {
+        // Our own redaction, skipping.
+        println!("Skipping redactions from ourselves.");
+        return Ok(());
+    }
+    if let Room::Joined(room) = room {
+        if let Some(id) = client.user_id() {
+            let id = id.to_owned();
+            tokio::spawn(async move {
+                // Find all messages in the room that are from us
+                let mut filter = RoomEventFilter::empty();
+                let senders = vec![id];
+                filter.senders = Some(&senders);
+                let rooms = vec![room.room_id().to_owned()];
+                filter.rooms = Some(&rooms);
+                let mut options = MessagesOptions::backward();
+                options.filter = filter;
+                if let Ok(messages) = room.messages(options).await {
+                    for m in &messages.chunk {
+                        // See, if any of the messages from us where in reply to the message that got removed
+                        if let Some((our_event_id, in_reply_to)) =
+                            try_to_parse_in_reply_to_from_raw(m)
+                        {
+                            if event.redacts == in_reply_to {
+                                // We don't really care much, if this works or not.
+                                let _ = room
+                                    .redact(
+                                        &our_event_id,
+                                        Some("Image got removed. Location pointless now."),
+                                        None,
+                                    )
+                                    .await;
+                                println!(
+                                    "Redacting {:?}, our response to redacted {:?}",
+                                    our_event_id, event.redacts
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    println!("Querying failed.");
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn login_and_sync(botconfig: BotConfig) -> anyhow::Result<()> {
     #[allow(unused_mut)]
     let mut client_builder = Client::builder().homeserver_url(botconfig.homeserver_url.clone());
@@ -126,6 +216,7 @@ async fn login_and_sync(botconfig: BotConfig) -> anyhow::Result<()> {
         client.add_event_handler(on_stripped_state_member);
     }
     client.add_event_handler(on_room_message);
+    client.add_event_handler(on_redacted_state_member);
 
     // since we called `sync_once` before we entered our sync loop we must pass
     // that sync token to `sync`
