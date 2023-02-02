@@ -272,7 +272,8 @@ async fn main() -> anyhow::Result<()> {
     let username = settings.get_string("username")?;
     let password = settings.get_string("password")?;
     let homeserver_url = settings.get_string("homeserver_url")?;
-    let ignore_own_messages = settings.get_bool("ignore_own_messages").unwrap_or(false);
+    // Currently not really used, but I leave it here in case we need it at some point
+    let ignore_own_messages = settings.get_bool("ignore_own_messages").unwrap_or(true);
     let autojoin = settings.get_bool("autojoin").unwrap_or(true);
     // -------------------------------------------------------
     let botconfig = BotConfig::new(
